@@ -1,9 +1,12 @@
+import csv
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
 
 from tokenizer.tokenizer import ByteTokenizer
-from model.transformer import Transformer
+from model.transformer_decoder_only import TransformerDecoderOnly
 
 
 # ============================================================
@@ -18,9 +21,9 @@ D_FF = 2048
 NUM_LAYERS = 6
 MAX_SEQ_LEN = 512
 
-BATCH_SIZE = 8
+BATCH_SIZE = 32
 LEARNING_RATE = 1e-4
-EPOCHS = 30
+EPOCHS = 3
 
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
@@ -35,10 +38,194 @@ tokenizer = ByteTokenizer()
 
 
 # ============================================================
+# Load CSV
+# ============================================================
+
+texts = []
+
+with open("cefr_leveled_texts.csv",
+    "r",
+    encoding="utf-8"
+) as f:
+
+    reader = csv.reader(f)
+
+    # Skip header
+    next(reader)
+
+    for row in reader:
+
+        if len(row) == 0:
+            continue
+
+        # ----------------------------------------------------
+        # First column contains English text/story
+        # ----------------------------------------------------
+
+        text = row[0].strip()
+
+        if text:
+            texts.append(text)
+
+
+print(f"Number of texts: {len(texts)}")
+
+
+# ============================================================
+# Dataset
+# ============================================================
+
+class TextDataset(Dataset):
+
+    def __init__(
+        self,
+        texts,
+        tokenizer,
+        max_seq_len
+    ):
+
+        self.samples = []
+
+        for text in texts:
+
+            # ------------------------------------------------
+            # Encode entire text
+            # ------------------------------------------------
+
+            tokens = tokenizer.encode(
+                text,
+                add_bos=True,
+                add_eos=True
+            )
+
+            # ------------------------------------------------
+            # Split long text into chunks
+            # ------------------------------------------------
+
+            # We need:
+            #
+            # input  = tokens[:-1]
+            # target = tokens[1:]
+            #
+            # Therefore each sample can contain at most
+            # MAX_SEQ_LEN tokens.
+            # ------------------------------------------------
+
+            for i in range(
+                0,
+                len(tokens) - 1,
+                max_seq_len
+            ):
+
+                chunk = tokens[
+                    i : i + max_seq_len
+                ]
+
+                # Need at least 2 tokens
+                if len(chunk) < 2:
+                    continue
+
+                input_ids = chunk[:-1]
+                target_ids = chunk[1:]
+
+                self.samples.append(
+                    (
+                        input_ids,
+                        target_ids
+                    )
+                )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+
+        return self.samples[idx]
+
+
+# ============================================================
+# Create Dataset
+# ============================================================
+
+dataset = TextDataset(
+    texts,
+    tokenizer,
+    MAX_SEQ_LEN
+)
+
+print(f"Number of training chunks: {len(dataset)}")
+
+
+# ============================================================
+# Collate Function
+# ============================================================
+
+def collate_fn(batch):
+
+    inputs = []
+    targets = []
+
+    max_len = max(
+        len(x[0])
+        for x in batch
+    )
+
+    for input_ids, target_ids in batch:
+
+        padding_length = max_len - len(input_ids)
+
+        # --------------------------------------------
+        # Pad input
+        # --------------------------------------------
+
+        input_ids = torch.cat([
+            input_ids,
+            torch.full(
+                (padding_length,),
+                tokenizer.PAD,
+                dtype=torch.long
+            )
+        ])
+
+        # --------------------------------------------
+        # Pad target
+        # --------------------------------------------
+
+        target_ids = torch.cat([
+            target_ids,
+            torch.full(
+                (padding_length,),
+                tokenizer.PAD,
+                dtype=torch.long
+            )
+        ])
+
+        inputs.append(input_ids)
+        targets.append(target_ids)
+
+    return (
+        torch.stack(inputs),
+        torch.stack(targets)
+    )
+
+
+# ============================================================
+# DataLoader
+# ============================================================
+
+dataloader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    collate_fn=collate_fn
+)
+
+
+# ============================================================
 # Model
 # ============================================================
 
-model = Transformer(
+model = TransformerDecoderOnly(
     vocab_size=VOCAB_SIZE,
     d_model=D_MODEL,
     num_heads=NUM_HEADS,
@@ -61,95 +248,18 @@ criterion = nn.CrossEntropyLoss(
 # Optimizer
 # ============================================================
 
-optimizer = optim.Adam(
+optimizer = optim.AdamW(
     model.parameters(),
-    lr=LEARNING_RATE
+    lr=LEARNING_RATE,
+    weight_decay=0.01
 )
-
-
-# ============================================================
-# Example training data
-# ============================================================
-#
-# For now, we're using a tiny toy dataset.
-# Later we'll replace this with your actual dataset.
-#
-# The task is:
-#
-# source:  "hello"
-# target:  "bonjour"
-#
-# The model learns:
-#
-# <BOS> b o n j o u r
-#              ↓
-# b o n j o u r <EOS>
-# ============================================================
-
-data = [
-    ("hello", "bonjour"),
-    ("good morning", "bonjour"),
-    ("good night", "bonne nuit"),
-    ("thank you", "merci"),
-    ("thanks", "merci"),
-    ("you are welcome", "de rien"),
-    ("how are you", "comment allez vous"),
-    ("i am fine", "je vais bien"),
-    ("i am happy", "je suis heureux"),
-    ("i am sad", "je suis triste"),
-    ("what is your name", "comment vous appelez vous"),
-    ("my name is john", "je m'appelle john"),
-    ("where are you", "ou etes vous"),
-    ("i am at home", "je suis a la maison"),
-    ("i love you", "je t'aime"),
-    ("i like this", "j'aime ca"),
-    ("i don't understand", "je ne comprends pas"),
-    ("please help me", "s'il vous plait aidez moi"),
-    ("see you tomorrow", "a demain"),
-    ("see you later", "a plus tard"),
-
-    ("the cat is sleeping", "le chat dort"),
-    ("the dog is running", "le chien court"),
-    ("the sun is shining", "le soleil brille"),
-    ("it is raining", "il pleut"),
-    ("the weather is good", "il fait beau"),
-    ("the weather is bad", "il fait mauvais"),
-    ("i am going home", "je rentre a la maison"),
-    ("i am going to school", "je vais a l'ecole"),
-    ("i am learning python", "j'apprends python"),
-    ("i am studying machine learning", "j'etudie l'apprentissage automatique"),
-
-    ("what are you doing", "que faites vous"),
-    ("i am reading a book", "je lis un livre"),
-    ("i am watching a movie", "je regarde un film"),
-    ("i am eating food", "je mange"),
-    ("i am drinking water", "je bois de l'eau"),
-    ("where is the bathroom", "ou sont les toilettes"),
-    ("where is the train station", "ou est la gare"),
-    ("how much does this cost", "combien ca coute"),
-    ("this is very good", "c'est tres bon"),
-    ("this is very bad", "c'est tres mauvais"),
-
-    ("one", "un"),
-    ("two", "deux"),
-    ("three", "trois"),
-    ("four", "quatre"),
-    ("five", "cinq"),
-    ("i have one book", "j'ai un livre"),
-    ("i have two dogs", "j'ai deux chiens"),
-
-    ("open the door", "ouvrez la porte"),
-    ("close the door", "fermez la porte"),
-    ("come here", "venez ici"),
-    ("go there", "allez la bas"),
-    ("wait for me", "attendez moi"),
-    ("let us go", "allons y"),
-]
 
 
 # ============================================================
 # Training
 # ============================================================
+
+print(f"Using device: {DEVICE}")
 
 model.train()
 
@@ -157,82 +267,75 @@ for epoch in range(EPOCHS):
 
     total_loss = 0.0
 
-    for source_text, target_text in data:
+    progress_bar = tqdm(
+        dataloader,
+        desc=f"Epoch {epoch + 1}/{EPOCHS}",
+        unit="batch"
+    )
+
+    for input_ids, target_ids in progress_bar:
 
         # ----------------------------------------------------
-        # Encode source
+        # Move to GPU
         # ----------------------------------------------------
 
-        src = tokenizer.encode(
-            source_text,
-            add_bos=True,
-            add_eos=True
-        )
-
-        # ----------------------------------------------------
-        # Encode target
-        # ----------------------------------------------------
-
-        target = tokenizer.encode(
-            target_text,
-            add_bos=True,
-            add_eos=True
-        )
-
-        # ----------------------------------------------------
-        # Teacher forcing
-        #
-        # target:
-        #
-        # <BOS> b o n j o u r <EOS>
-        #
-        # decoder input:
-        #
-        # <BOS> b o n j o u r
-        #
-        # expected output:
-        #
-        # b o n j o u r <EOS>
-        # ----------------------------------------------------
-
-        tgt_input = target[:-1]
-
-        tgt_output = target[1:]
-
-        # Add batch dimension
-        src = src.unsqueeze(0).to(DEVICE)
-        tgt_input = tgt_input.unsqueeze(0).to(DEVICE)
-        tgt_output = tgt_output.unsqueeze(0).to(DEVICE)
+        input_ids = input_ids.to(DEVICE)
+        target_ids = target_ids.to(DEVICE)
 
         # ----------------------------------------------------
         # Forward pass
         # ----------------------------------------------------
 
-        logits = model(
-            src,
-            tgt_input
+        #
+        # Decoder-only model:
+        #
+        # input_ids
+        #      ↓
+        # Transformer
+        #      ↓
+        # logits
+        #
+        # [B, T, VOCAB_SIZE]
+        #
+
+        logits = model(input_ids)
+
+        # ----------------------------------------------------
+        # Reshape for CrossEntropyLoss
+        # ----------------------------------------------------
+
+        # logits:
+        #
+        # [B, T, V]
+        #
+        # becomes:
+        #
+        # [B*T, V]
+        #
+
+        logits = logits.reshape(
+            -1,
+            VOCAB_SIZE
         )
 
-        # logits:
-        # [B, T, VOCAB_SIZE]
-
-        # ----------------------------------------------------
-        # CrossEntropyLoss
-        # ----------------------------------------------------
-
-        # CrossEntropyLoss expects:
-        #
-        # logits:
-        # [B, VOCAB_SIZE, T]
-        #
         # target:
+        #
         # [B, T]
+        #
+        # becomes:
+        #
+        # [B*T]
+        #
 
-        logits = logits.transpose(1, 2)
+        targets = target_ids.reshape(-1)
+
+        # ----------------------------------------------------
+        # Loss
+        # ----------------------------------------------------
 
         loss = criterion(
             logits,
-            tgt_output
+            targets
         )
 
         # ----------------------------------------------------
@@ -243,20 +346,36 @@ for epoch in range(EPOCHS):
 
         loss.backward()
 
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            max_norm=1.0
+        )
+
         optimizer.step()
+
+        # ----------------------------------------------------
+        # Logging
+        # ----------------------------------------------------
 
         total_loss += loss.item()
 
-    average_loss = total_loss / len(data)
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}"
+        )
+
+    average_loss = (
+        total_loss / len(dataloader)
+    )
 
     print(
         f"Epoch [{epoch + 1}/{EPOCHS}] "
-        f"Loss: {average_loss:.4f}"
+        f"Average Loss: {average_loss:.4f}"
     )
 
 
 # ============================================================
-# Save model
+# Save Model
 # ============================================================
 
 torch.save(
